@@ -1,0 +1,29 @@
+name: ci
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ferry
+          POSTGRES_PASSWORD: ferry
+          POSTGRES_DB: ferry
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ferry" --health-interval 2s --health-timeout 5s --health-retries 15
+    env:
+      FERRY_TEST_POSTGRES_DSN: postgresql://ferry:ferry@localhost:5432/ferry
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - run: uv run ruff check src tests examples
+      - name: generated stubs are up to date
+        run: ./scripts/gen_proto.sh && git diff --exit-code src/ferry/v1
+      - run: uv run pytest -q
