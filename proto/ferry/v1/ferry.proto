@@ -1,0 +1,163 @@
+// Ferry v1 wire protocol. See adr/DESIGN.md §4.
+syntax = "proto3";
+package ferry.v1;
+
+// ───────────────────────── Coordinator ─────────────────────────
+
+service Coordinator {
+  // Long-lived control-plane stream. First message from the node must be Register.
+  rpc Session(stream NodeMsg) returns (stream CoordinatorMsg);
+
+  // Aggregator only: commit a checkpoint that is already fully persisted in blob storage.
+  rpc CommitCheckpoint(CommitCheckpointRequest) returns (CommitCheckpointResponse);
+}
+
+enum NodeType {
+  NODE_TYPE_UNSPECIFIED = 0;
+  NODE_TYPE_WORKER      = 1;
+  NODE_TYPE_AGGREGATOR  = 2;
+}
+
+message NodeMsg {
+  oneof msg {
+    Register         register  = 1;
+    DescribeResponse describe  = 2;
+    Heartbeat        heartbeat = 3;
+    StateUpdate      state     = 4;
+  }
+}
+
+message CoordinatorMsg {
+  oneof msg {
+    RegisterAck     register_ack   = 1;
+    DescribeRequest describe       = 2;
+    NewCheckpoint   new_checkpoint = 3;
+    AggregatorInfo  aggregator     = 4;  // sent on register and whenever the active aggregator changes
+    Shutdown        shutdown       = 5;
+  }
+}
+
+message Register {
+  NodeType type           = 1;
+  string   node_id        = 2;  // empty on first registration; reuse to resume
+  string   advertise_addr = 3;  // aggregator only: address workers should dial
+  string   version        = 4;  // Ferry version
+}
+
+message RegisterAck {
+  string node_id               = 1;
+  uint64 epoch                 = 2;  // aggregator only (see DESIGN §8.3)
+  string latest_checkpoint_id  = 3;  // empty if training has not started
+  uint64 latest_global_version = 4;
+  string node_state_id         = 5;  // last persisted per-node state, empty if none
+  string latest_checkpoint_uri = 6;  // blob URI of latest_checkpoint_id (additive to the spec)
+}
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  // Worker-owned config. Opaque keys allowed; well-known keys below.
+  uint32 h          = 1;
+  double inner_lr   = 2;
+  uint32 batch_size = 3;
+  string device     = 4;  // e.g. "cuda:0", "A100-80GB"
+  map<string, string> extra = 15;
+}
+
+message Heartbeat {
+  NodeState state               = 1;
+  uint64    base_global_version = 2;
+  uint32    inner_step          = 3;  // progress within the current local run
+  double    loss                = 4;
+  double    samples_per_sec     = 5;
+  double    gpu_util            = 6;
+}
+
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  NODE_STATE_JOINING     = 1;
+  NODE_STATE_IDLE        = 2;
+  NODE_STATE_TRAINING    = 3;
+  NODE_STATE_UPLOADING   = 4;
+  NODE_STATE_AGGREGATING = 5;  // aggregator only
+}
+
+message StateUpdate {
+  // A node persisted its own resumable state to blob storage.
+  string node_state_id = 1;
+}
+
+message NewCheckpoint {
+  string checkpoint_id  = 1;
+  uint64 global_version = 2;
+  string uri            = 3;
+}
+
+message AggregatorInfo {
+  string addr  = 1;
+  uint64 epoch = 2;
+}
+
+message Shutdown { string reason = 1; }
+
+// Audit record for a delta the aggregator accepted, rejected or applied (DESIGN §5 `deltas`).
+message DeltaRecord {
+  string delta_id            = 1;
+  string worker_id           = 2;
+  uint64 base_global_version = 3;
+  uint32 inner_steps         = 4;
+  uint64 num_samples         = 5;
+  string status              = 6;  // accepted | rejected | applied
+  string reason              = 7;
+}
+
+message CommitCheckpointRequest {
+  string aggregator_id      = 1;
+  uint64 epoch              = 2;
+  string checkpoint_id      = 3;
+  string uri                = 4;
+  uint64 parent_version     = 5;  // global version this checkpoint was built on
+  repeated string delta_ids = 6;  // deltas folded into this checkpoint
+  repeated DeltaRecord delta_records = 7;  // audit log entries since the last commit (additive to the spec)
+  bool   initial            = 8;  // true for the very first (version 0) checkpoint
+}
+
+message CommitCheckpointResponse {
+  bool   accepted       = 1;
+  uint64 global_version = 2;
+  string reason         = 3;  // set when rejected
+}
+
+// ───────────────────────── Aggregator ─────────────────────────
+
+service Aggregator {
+  rpc PushDelta(stream DeltaChunk) returns (PushDeltaAck);
+}
+
+message DeltaChunk {
+  // Header fields are required on the first chunk (seq = 0) and ignored after.
+  DeltaHeader header = 1;
+  uint32      seq    = 2;
+  bytes       data   = 3;  // slice of a safetensors blob
+  bool        last   = 4;
+}
+
+message DeltaHeader {
+  string delta_id            = 1;  // UUID, used for idempotent retries
+  string worker_id           = 2;
+  string base_checkpoint_id  = 3;
+  uint64 base_global_version = 4;
+  uint32 inner_steps         = 5;  // actual steps covered by this delta (may exceed H, see DESIGN §7.1)
+  uint64 num_samples         = 6;
+  double local_loss          = 7;
+  uint64 total_bytes         = 8;
+  string sha256              = 9;
+}
+
+message PushDeltaAck {
+  bool   accepted              = 1;
+  string reason                = 2;  // e.g. "too_stale", "duplicate"
+  string latest_checkpoint_id  = 3;
+  uint64 latest_global_version = 4;
+  string latest_checkpoint_uri = 5;  // additive to the spec
+}
